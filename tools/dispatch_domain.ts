@@ -178,6 +178,7 @@ async function main(): Promise<void> {
   // parse, and tally call below is imported, never rewritten.
   const roundMod = await import(`${RR_SCRIPTS}/rr_aicm_round.ts`);
   const batchMod = await import(`${RR_SCRIPTS}/rr_aicm_batch.ts`);
+  const { resolveSpecialistKey } = await import(`${RR_SCRIPTS}/rr_specialist_access.ts`);
   const { CONTAINER, MAPPER_CONTAINER, PRIMITIVES, buildReviewsJson, parseNote, parseSynthesis, parseVerdict, tally, withIndependenceNote } =
     roundMod;
   const { domainControls, batchContributePrompt, batchSynthesizePrompt, batchReviewPrompt, parseBatchLines } = batchMod;
@@ -186,13 +187,13 @@ async function main(): Promise<void> {
   const { mkdirSync, writeFileSync } = await import("node:fs");
   const { join } = await import("node:path");
 
-  // No default: this is a real host + key, not something to bake into a public repo. Both
-  // are required env vars, and dispatch fails loudly rather than silently pointing at
-  // whichever host happened to be hardcoded here before.
+  // No default: this is real infrastructure, not something to bake into a public repo. SSH_KEY
+  // is resolved per-container by resolveSpecialistKey() (rockin-robin#4) -- no dispatch here
+  // ever falls back to one shared key reaching every specialist. See
+  // docs/PER_CONTAINER_ACCESS_SETUP.md in rockin-robin for the full setup.
   const VPS = process.env.AKCM_VPS;
-  const SSH_KEY = process.env.AKCM_SSH_KEY;
-  if (!VPS || !SSH_KEY) {
-    throw new Error("AKCM_VPS and AKCM_SSH_KEY must both be set (no default host is shipped here)");
+  if (!VPS) {
+    throw new Error("AKCM_VPS must be set (no default host is shipped here)");
   }
 
   const spend = { input: 0, output: 0, cacheCreate: 0, cacheRead: 0, dispatches: 0 };
@@ -212,11 +213,12 @@ async function main(): Promise<void> {
   const CONTAINER_USER = process.env.AKCM_CONTAINER_USER ?? "isme";
 
   async function dispatch(container: string, prompt: string): Promise<string> {
+    const sshKey = resolveSpecialistKey(container);
     const remote =
       `docker exec -i -u ${CONTAINER_USER} -w /home/${CONTAINER_USER} -e AKCM_MAX_TURNS=${process.env.AKCM_MAX_TURNS ?? 24} ` +
       `${container} node /home/${CONTAINER_USER}/sdk_runner_v2.js -`;
     const out = await new Promise<string>((resolve, reject) => {
-      const child = spawn("ssh", ["-i", SSH_KEY, "-o", "BatchMode=yes", VPS, remote]);
+      const child = spawn("ssh", ["-i", sshKey, "-o", "BatchMode=yes", VPS, remote]);
       let buf = "";
       const timer = setTimeout(() => {
         child.kill("SIGKILL");

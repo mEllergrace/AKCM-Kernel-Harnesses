@@ -76,6 +76,16 @@ CSA's Security-Standards-Mapping factory and its underlying dataset repo. The ha
 dispatch code itself — everything that can actually be inspected and run — is fully open
 here.
 
+Also not vendored: any actual SSH key, VPS, or container image. `tools/dispatch_domain.ts`
+reaches the specialist containers over SSH, and each container gets its own dedicated
+key — never one shared key reaching all of them
+([rockin-robin#4](https://github.com/moonsoup/rockin-robin/issues/4)). Setting that up —
+generating the keys, restricting each to its own container, wiring the env vars — is a
+real infrastructure step that belongs to your own install. The full walkthrough (and the
+`authorized_keys` enforcement script) lives in
+[`rockin-robin/docs/PER_CONTAINER_ACCESS_SETUP.md`](https://github.com/mEllergrace/rockin-robin/blob/main/docs/PER_CONTAINER_ACCESS_SETUP.md),
+since that's also where the sibling checkout this repo's dispatch code depends on lives.
+
 ## Running the tests
 
 ```
