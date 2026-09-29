@@ -49,9 +49,13 @@ def _nontrivial(text):
     return isinstance(text, str) and len(text.strip()) >= MIN_TEXT
 
 
-def check_entry(entry, path):
+def check_entry(entry, path, require_per_primitive=False):
     """Return a list of violation strings for one parsed entry dict. Pure —
-    takes an already-loaded dict so tests don't need real files on disk."""
+    takes an already-loaded dict so tests don't need real files on disk.
+
+    require_per_primitive (opt-in, --require-per-primitive-execution): every primitive of
+    an attested mechanism claim must carry its OWN `execution` block (AKCM-Mappings#1).
+    Off by default so existing callers see unchanged behaviour."""
     v = []
     cid = entry.get("aicm_control_id") or "<no id>"
 
@@ -94,6 +98,16 @@ def check_entry(entry, path):
             v.append(f"{tag}: citation '{citation}' is not an https:// URL")
         elif "#" not in citation:
             v.append(f"{tag}: citation '{citation}' has no #fragment — a bare page URL is not a citation")
+        pex = p.get("execution")
+        if pex is not None:
+            for f in ("kernel_release", "kernel_arch", "probe", "observed", "runner"):
+                if not (pex or {}).get(f):
+                    v.append(f"{tag}.execution.{f} is required and missing")
+            if (pex or {}).get("runner") and pex["runner"] not in RUNNERS:
+                v.append(f"{tag}.execution.runner '{pex['runner']}' is not one of {sorted(RUNNERS)}")
+        elif require_per_primitive and entry.get("attestation_state") == "attested":
+            v.append(f"{tag}: attested, but this primitive has no own execution record — "
+                     "one probe of another primitive does not attest it")
 
     if not _nontrivial(entry.get("rationale", "")):
         v.append(f"{cid}: rationale missing or too short")
@@ -207,6 +221,9 @@ def _load_entries(catalog_dir):
 
 
 def main(argv):
+    argv = list(argv)
+    strict = "--require-per-primitive-execution" in argv
+    argv = [a for a in argv if a != "--require-per-primitive-execution"]
     catalog_dir = Path(argv[0]) if argv else CATALOG_DIR
     if not catalog_dir.exists():
         print(f"FAIL: {catalog_dir} does not exist", file=sys.stderr)
@@ -221,7 +238,7 @@ def main(argv):
 
     violations = []
     for entry, path in zip(entries, paths):
-        violations.extend(check_entry(entry, path))
+        violations.extend(check_entry(entry, path, require_per_primitive=strict))
     violations.extend(check_register(entries, paths))
 
     print(f"Checked {len(entries)} catalog entr{'y' if len(entries) == 1 else 'ies'}")

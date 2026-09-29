@@ -12,6 +12,10 @@ from kernel_harness import (
     build_gvisor_install_argv,
     build_runtime_probe_argv,
     parse_runtime_probe,
+    build_qemu_run_spec,
+    build_seed_iso_argv,
+    verify_sha256_line,
+    run_qemu_vm,
 )
 
 
@@ -192,6 +196,69 @@ class TestQemuProbeBackend(unittest.TestCase):
         argv = " ".join(spec["argv"])
         self.assertIn("accel=hvf", argv)
         self.assertNotIn("runsc", argv)
+
+
+class TestQemuRunBackend(unittest.TestCase):
+    """Generic disposable-VM launch: the probe builder above only ever built a spec, nothing
+    launched it. These pin the properties that make a VM run count as evidence: the base
+    image is never written (-snapshot), the guest's own uname is what gets reported, and a
+    downloaded image is checksum-verified before it is booted."""
+
+    def test_run_spec_is_disposable_and_carries_the_given_user_data(self):
+        spec = build_qemu_run_spec("/r", "/r/base.img", "/fw/code.fd", "#cloud-config\n", "akcm-x")
+        self.assertIn("-snapshot", spec["argv"])
+        self.assertEqual(spec["user_data"], "#cloud-config\n")
+        self.assertIn("instance-id: akcm-x", spec["meta_data"])
+        self.assertIn("network:\n  config: disabled", spec["meta_data"])
+        self.assertIn("accel=hvf", " ".join(spec["argv"]))
+
+    def test_probe_builder_output_is_unchanged_by_the_generic_path(self):
+        spec = build_qemu_probe_script("/r", "cgroup2", "/r/img.qcow2", "/fw/code.fd")
+        self.assertNotIn("-snapshot", spec["argv"])
+        self.assertIn("instance-id: akcm-probe", spec["meta_data"])
+
+    def test_probe_contract_now_records_architecture(self):
+        spec = build_qemu_probe_script("/r", "cgroup2", "/r/img.qcow2", "/fw/code.fd")
+        self.assertIn("echo ARCH=$(uname -m)", spec["user_data"])
+        got = parse_mechanism_probe("KERNEL=6.8.0-1-generic\nARCH=aarch64\nPROBE=cgroup2\nRESULT=1")
+        self.assertEqual(got["arch"], "aarch64")
+        self.assertEqual(parse_mechanism_probe("KERNEL=k\nPROBE=p\nRESULT=1")["arch"], "")
+
+    def test_seed_iso_is_labelled_cidata_for_nocloud(self):
+        argv = build_seed_iso_argv("/r/seed", "/r/seed.iso", platform="darwin")
+        self.assertEqual(argv[0], "hdiutil")
+        self.assertIn("cidata", argv)
+        argv = build_seed_iso_argv("/r/seed", "/r/seed.iso", platform="linux")
+        self.assertIn("cidata", argv)
+
+    def test_checksum_mismatch_is_refused(self):
+        sums = "abc123 *noble.img\nfff *other.img\n"
+        self.assertTrue(verify_sha256_line(sums, "noble.img", "abc123"))
+        self.assertFalse(verify_sha256_line(sums, "noble.img", "999"))
+        self.assertFalse(verify_sha256_line(sums, "missing.img", "abc123"))
+
+    def test_run_writes_seed_then_boots_and_returns_serial_output(self):
+        import tempfile
+        calls = []
+
+        class P:
+            def __init__(self, out):
+                self.stdout, self.stderr, self.returncode = out, "", 0
+
+        def fake(argv, **kw):
+            calls.append(argv[0])
+            return P("boot\nAKCM-OUT\n" if argv[0].startswith("qemu") else "")
+
+        with tempfile.TemporaryDirectory() as d:
+            import os
+            vars_src = os.path.join(d, "vars.fd")
+            open(vars_src, "wb").write(b"\0" * 16)
+            spec = build_qemu_run_spec(d, "/base.img", "/code.fd", "#cloud-config\n", "t")
+            out = run_qemu_vm(spec, d, vars_template=vars_src, timeout=5, runner=fake, platform="darwin")
+            self.assertTrue(os.path.exists(os.path.join(d, "seed", "user-data")))
+            self.assertTrue(os.path.exists(os.path.join(d, "efi-vars.fd")))
+        self.assertEqual(calls, ["hdiutil", "qemu-system-aarch64"])
+        self.assertIn("AKCM-OUT", out)
 
 
 class TestCliSurface(unittest.TestCase):

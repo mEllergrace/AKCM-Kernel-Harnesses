@@ -229,3 +229,75 @@ class EmitAkcmEntryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _two_primitive_synthesis(control_id="UEM-10"):
+    syn = _synthesis(control_id)
+    syn["primitives"].append({
+        "primitive": "seccomp",
+        "mechanism": "SECCOMP_RET_LOG writes an audit record per filtered syscall",
+        "role": "supporting",
+        "citation": "https://docs.kernel.org/userspace-api/seccomp_filter.html#return-values",
+    })
+    return syn
+
+
+class PerPrimitiveExecutionTests(unittest.TestCase):
+    """mEllergrace/AKCM-Mappings#1, #2, #3: execution was recorded for primitives[0] only,
+    kernel_baseline defaulted to an unmeasured 6.12, and the validator gate was documented
+    but never called."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.catalog = Path(self.tmp.name) / "catalog"
+        self.catalog.mkdir()
+        self.known = {"UEM-10": {"domain": "Universal Endpoint Management", "title": "Software Firewall"}}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_primitive_without_its_own_record_keeps_the_entry_unattested(self):
+        path, errors = eae.emit(_two_primitive_synthesis(), _reviews(), self.known, self.catalog,
+                                execution_records=_execution_records(), **PROVENANCE_ARGS)
+        self.assertEqual(errors, [])
+        self.assertIn("_unattested", str(path))
+        self.assertIn("attestation_state: asserted", path.read_text())
+
+    def test_every_primitive_carries_its_own_execution_block_when_all_were_executed(self):
+        recs = _execution_records()
+        recs["UEM-10"]["seccomp"] = {"kernel_release": "6.8.0-142-generic", "kernel_arch": "aarch64",
+                                     "probe": "akcm-wall:UEM-10:seccomp:x", "observed": "audit: type=1326 ...",
+                                     "runner": "qemu"}
+        path, errors = eae.emit(_two_primitive_synthesis(), _reviews(), self.known, self.catalog,
+                                execution_records=recs, **PROVENANCE_ARGS)
+        self.assertEqual(errors, [])
+        self.assertNotIn("_unattested", str(path))
+        import yaml
+
+        entry = yaml.safe_load(path.read_text())
+        self.assertEqual([p["execution"]["kernel_release"] for p in entry["primitives"]],
+                         ["6.8.0-136-generic", "6.8.0-142-generic"])
+        # the top-level block is kept for existing readers
+        self.assertEqual(entry["provenance"]["execution"]["kernel_release"], "6.8.0-136-generic")
+
+    def test_kernel_baseline_is_not_defaulted_to_an_unmeasured_version(self):
+        syn = _synthesis()
+        del syn["kernel_baseline"]
+        path, _ = eae.emit(syn, _reviews(), self.known, self.catalog,
+                           execution_records=_execution_records(), **PROVENANCE_ARGS)
+        self.assertIn('kernel_baseline: "6.8.0-136-generic"', path.read_text())
+        self.assertNotIn("6.12", path.read_text())
+
+    def test_an_explicit_kernel_baseline_is_still_honoured(self):
+        path, _ = eae.emit(_synthesis(), _reviews(), self.known, self.catalog,
+                           execution_records=_execution_records(), **PROVENANCE_ARGS)
+        self.assertIn('kernel_baseline: "6.12"', path.read_text())
+
+    def test_emit_refuses_an_entry_the_validator_rejects(self):
+        syn = _synthesis()
+        syn["primitives"][0]["mechanism"] = "too short"  # passes validate_synthesis, fails MIN_TEXT
+        path, errors = eae.emit(syn, _reviews(), self.known, self.catalog,
+                                execution_records=_execution_records(), **PROVENANCE_ARGS)
+        self.assertIsNone(path)
+        self.assertTrue(any("check_catalog_entries" in e for e in errors), errors)
+        self.assertEqual(list(self.catalog.rglob("*.yaml")), [])
