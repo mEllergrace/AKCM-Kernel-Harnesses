@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # build-ok: searched scripts/ across the CSA repos before writing this. Found
 # ZTAF-Primitive-Mapping/scripts/check_catalog_entries.py (v1) — unusable as-is: it
 # validates atf_pillar/requirement_ids/primitive_family against catalog/vocabulary/*.yaml,
@@ -7,7 +8,6 @@
 # validating catalog/*.yaml against MANIFEST.yaml's schema — this repo's scripts/ dir
 # does not exist yet. Extending v1 in place would silently start accepting the wrong
 # field names for a different repo's schema.
-#!/usr/bin/env python3
 """Validate AKCM catalog entries (catalog/*.yaml) against the AICM-control-keyed
 schema in MANIFEST.yaml and the provenance/execution/independence gates in
 provenance/schema.md and ASSURANCE.md.
@@ -62,8 +62,13 @@ def check_entry(entry, path, require_per_primitive=False):
     if not entry.get("aicm_control_id"):
         v.append(f"{path}: missing aicm_control_id")
 
+    # aicm_domain (AKCM-native, from the AICM register) replaces the ZTAF-era atf_pillar
+    # (#8). An entry needs one of them; atf_pillar, when present, must still be valid.
     pillar = entry.get("atf_pillar")
-    if pillar not in PILLARS:
+    domain = entry.get("aicm_domain")
+    if pillar is None and not (isinstance(domain, str) and domain.strip()):
+        v.append(f"{cid}: aicm_domain is required (the AICM domain from the register)")
+    if pillar is not None and pillar not in PILLARS:
         v.append(f"{cid}: atf_pillar '{pillar}' not one of {sorted(PILLARS)}")
 
     gap = entry.get("gap")
