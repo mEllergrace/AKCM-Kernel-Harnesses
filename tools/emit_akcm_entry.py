@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # build-ok: searched ZTAF-Primitive-Mapping-v2/scripts/emit_entry.py (the retracted repo's
 # emit script, licensed by docs/HANDOFF.md for reuse "as Engine K's implementation") in
 # detail before writing this. Its render/fold/validate shape is adopted almost verbatim
@@ -9,7 +10,6 @@
 # path. Those three gaps are exactly what the retracted run got wrong per
 # AKCM-Mappings/ASSURANCE.md, so they could not be inherited unexamined even though the
 # rendering logic they sit inside of was fine to keep.
-#!/usr/bin/env python3
 """Emit a provenance-complete AKCM catalog entry from a dispatch_domain.ts synthesis result
 plus its reviews.json, per AKCM-Mappings/provenance/schema.md.
 
@@ -66,7 +66,9 @@ def validate_synthesis(syn, identity_known):
             f"aicm_control_id {syn.get('aicm_control_id')!r} is not in the AICM control register — "
             "identity must come from akcm_sources.py verbatim, never invented from the synthesis result"
         )
-    if syn.get("atf_pillar") not in PILLARS:
+    # atf_pillar is ZTAF vocabulary, replaced by the AKCM-native aicm_domain (#8). It is
+    # still validated when a synthesis carries it, but no longer required or emitted.
+    if "atf_pillar" in syn and syn.get("atf_pillar") not in PILLARS:
         errors.append(f"atf_pillar {syn.get('atf_pillar')!r} not one of {sorted(PILLARS)}")
 
     is_gap = bool(syn.get("gap"))
@@ -112,9 +114,19 @@ def _reviewers_block(reviews_entry):
 
 
 def render_entry(control_id, domain, title, syn, reviews_entry, execution_by_primitive,
-                  attestation_state, **provenance_args):
+                  attestation_state, baseline_from_execution=False, caveats=None, **provenance_args):
     out = ['schema_version: "1.0"', "", f'aicm_control_id: "{control_id}"']
-    out += [f"atf_pillar: {syn['atf_pillar']}", "", f"kernel_baseline: \"{syn.get('kernel_baseline', '6.12')}\"", ""]
+    # AKCM-native classification, straight from the AICM register (#8) -- replaces atf_pillar.
+    out += [f"aicm_domain: {json.dumps(domain)}", ""]
+    # An explicit baseline from the synthesis is honoured by default. Otherwise -- or always,
+    # with baseline_from_execution -- it is the kernel a mechanism was actually executed on,
+    # never an unmeasured default (AKCM-Mappings#2).
+    baseline = "" if baseline_from_execution else str(syn.get("kernel_baseline", "")).strip()
+    if not baseline and execution_by_primitive:
+        baseline = next((ex.get("kernel_release") for ex in execution_by_primitive.values()
+                         if ex.get("kernel_release")), "")
+    if baseline:
+        out += [f'kernel_baseline: "{baseline}"', ""]
 
     if syn.get("gap"):
         out += ["gap: true", "", "gap_reason: >", _fold(syn["gap_reason"]), ""]
@@ -128,11 +140,19 @@ def render_entry(control_id, domain, title, syn, reviews_entry, execution_by_pri
                 out.append(f"    min_kernel: \"{p['min_kernel']}\"")
             out.append(f"    role: {p['role']}")
             out.append(f"    citation: \"{p['citation']}\"")
+            ex = (execution_by_primitive or {}).get(p["primitive"])
+            if ex:  # this primitive's OWN execution record (AKCM-Mappings#1)
+                out.append("    execution:")
+                for f in ("kernel_release", "kernel_arch", "probe", "observed", "runner"):
+                    out.append(f"      {f}: {json.dumps(str(ex.get(f, '')))}")
         out.append("")
 
     out += ["rationale: |", _block(syn["rationale"]), ""]
     out += ["workflow: |", _block(syn["workflow"]), ""]
     notes = str(syn.get("notes", "")).strip()
+    for prim, texts in sorted(((caveats or {}).get(control_id) or {}).items()):
+        for t in texts:  # evidence-derived caveats (AKCM-Wall), appended, never replacing
+            notes = (notes + " " if notes else "") + f"[{prim}] {t}"
     if notes:
         out += ["notes: >", _fold(notes), ""]
 
@@ -150,10 +170,13 @@ def render_entry(control_id, domain, title, syn, reviews_entry, execution_by_pri
     has_mechanism_claim = bool(syn.get("primitives"))
     if has_mechanism_claim and execution_by_primitive:
         out.append("  execution:")
-        first_prim = syn["primitives"][0]["primitive"]
+        # Legacy top-level block (kept for existing readers): from the first primitive that
+        # was actually executed, never an empty copy of an unexecuted primitives[0].
+        first_prim = next((p["primitive"] for p in syn["primitives"] if execution_by_primitive.get(p["primitive"])),
+                          syn["primitives"][0]["primitive"])
         ex = execution_by_primitive.get(first_prim, {})
         for f in ("kernel_release", "kernel_arch", "probe", "observed", "runner"):
-            out.append(f'    {f}: "{ex.get(f, "")}"')
+            out.append(f"    {f}: {json.dumps(str(ex.get(f, '')))}")  # escaped: observed text carries quotes
         out.append("  min_kernel_basis: measured")
     else:
         out.append("  min_kernel_basis: unverified")
@@ -174,8 +197,21 @@ def render_entry(control_id, domain, title, syn, reviews_entry, execution_by_pri
     return "\n".join(out).rstrip("\n") + "\n"
 
 
+def _validate_rendered(text, path):
+    import yaml
+
+    scripts = Path(__file__).resolve().parent.parent / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import check_catalog_entries
+
+    rel = path.relative_to(path.parents[1]) if "_unattested" not in path.parts else \
+        Path("catalog") / "_unattested" / path.name
+    return check_catalog_entries.check_entry(yaml.safe_load(text), str(rel))
+
+
 def emit(synthesis, reviews, known_controls, catalog, execution_records=None, write=True,
-         overwrite=False, **provenance_args):
+         overwrite=False, baseline_from_execution=False, caveats=None, **provenance_args):
     """known_controls: {control_id: {domain, title}} — from akcm_sources.py, never invented.
     execution_records: {control_id: {primitive: {kernel_release,...}}} or None.
     Returns (path, errors). errors non-empty => path is None (refused, nothing written)."""
@@ -196,7 +232,10 @@ def emit(synthesis, reviews, known_controls, catalog, execution_records=None, wr
 
     has_mechanism_claim = bool(synthesis.get("primitives"))
     exec_for_control = (execution_records or {}).get(cid)
-    attested = (not has_mechanism_claim) or bool(exec_for_control)
+    # Every primitive needs its OWN record; one probe for the first primitive no longer
+    # attests the rest (AKCM-Mappings#1).
+    attested = (not has_mechanism_claim) or all(
+        (exec_for_control or {}).get(p["primitive"]) for p in synthesis.get("primitives") or [])
     attestation_state = "attested" if attested else "asserted"
 
     subdir = catalog if attestation_state == "attested" else (catalog / "_unattested")
@@ -206,18 +245,23 @@ def emit(synthesis, reviews, known_controls, catalog, execution_records=None, wr
     stale_path = other_subdir / f"{stem_for(cid)}.yaml"
     if path.exists() and not overwrite:
         return None, [f"{path.name} already exists — refusing to overwrite. Pass overwrite=True deliberately."]
+    text = render_entry(
+        cid, known_controls[cid]["domain"], known_controls[cid]["title"], synthesis,
+        reviews_entry, exec_for_control, attestation_state,
+        baseline_from_execution=baseline_from_execution, caveats=caveats, **provenance_args,
+    )
+    # The documented gate, now real (AKCM-Mappings#3): nothing is written that
+    # check_catalog_entries.check_entry would reject.
+    violations = _validate_rendered(text, path)
+    if violations:
+        return None, [f"check_catalog_entries: {v}" for v in violations]
     # A control's attestation state can flip between runs (an execution record lands, or is
     # retracted). Without this, the stale copy in the OTHER location silently sits beside the
     # new one -- both individually valid, but check_register flags the duplicate id, and worse,
     # a reader could find the stale one first. Only remove it once the new one is confirmed
-    # writable (overwrite check above already passed), never before.
+    # writable AND valid (overwrite check and validator gate above passed), never before.
     if write and stale_path.exists() and stale_path != path:
         stale_path.unlink()
-
-    text = render_entry(
-        cid, known_controls[cid]["domain"], known_controls[cid]["title"], synthesis,
-        reviews_entry, exec_for_control, attestation_state, **provenance_args,
-    )
     if write:
         path.write_text(text, encoding="utf-8")
     return path, []
@@ -237,6 +281,9 @@ def main(argv=None):
     ap.add_argument("--date", required=True)
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--check", action="store_true", help="validate and report; write nothing")
+    ap.add_argument("--baseline-from-execution", action="store_true",
+                    help="set kernel_baseline from the executed kernel even when the synthesis states one")
+    ap.add_argument("--caveats", type=Path, help="JSON {control_id: {primitive: [text, ...]}} appended to notes")
     args = ap.parse_args(argv)
 
     here = Path(__file__).resolve().parent
@@ -250,6 +297,7 @@ def main(argv=None):
         json.loads(args.execution_records.read_text(encoding="utf-8")) if args.execution_records else None
     )
     all_controls = {c["id"]: {"domain": c["domain"], "title": c["title"]} for c in akcm_sources.all_controls()}
+    caveats = json.loads(args.caveats.read_text(encoding="utf-8")) if args.caveats else None
 
     provenance_args = dict(
         selection_record=args.selection_record, delivery_brief=args.delivery_brief,
@@ -261,7 +309,8 @@ def main(argv=None):
         cid = syn.get("aicm_control_id", "?")
         path, errors = emit(
             syn, reviews, all_controls, args.catalog, execution_records=execution_records,
-            write=not args.check, overwrite=args.overwrite, **provenance_args,
+            write=not args.check, overwrite=args.overwrite,
+            baseline_from_execution=args.baseline_from_execution, caveats=caveats, **provenance_args,
         )
         if errors:
             rc = 1

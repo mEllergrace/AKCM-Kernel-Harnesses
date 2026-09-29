@@ -24,8 +24,11 @@ strength (AICM AIS-13): whether agent-generated code runs on plain runc or a har
 runtime like gVisor, and installing the latter when it's missing.
 """
 import argparse
+import hashlib
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -76,6 +79,7 @@ def build_mechanism_probe_argv(vps, ssh_key, image, probe):
         )
     body = (
         "echo KERNEL=$(uname -r); "
+        "echo ARCH=$(uname -m); "
         f"echo PROBE={probe}; "
         f"echo RESULT=$({KERNEL_PROBES[probe]})"
     )
@@ -98,6 +102,7 @@ def build_qemu_probe_script(runner_dir, probe, image, efi_code):
     user_data = (
         "#cloud-config\nruncmd:\n  - |\n"
         "    echo KERNEL=$(uname -r)\n"
+        "    echo ARCH=$(uname -m)\n"
         f"    echo PROBE={probe}\n"
         f"    echo RESULT=$({KERNEL_PROBES[probe]})\n"
         "  - poweroff\n"
@@ -119,6 +124,80 @@ def build_qemu_probe_script(runner_dir, probe, image, efi_code):
     }
 
 
+def build_qemu_run_spec(runner_dir, image, efi_code, user_data, instance_id):
+    """Generic DISPOSABLE VM run: boot `image` with arbitrary cloud-init `user_data`.
+
+    Unlike build_qemu_probe_script (kept as-is), this passes -snapshot so the base image is
+    never written -- every run starts from the same bytes, which is what makes two runs
+    comparable. The caller's user_data is responsible for printing its results to the
+    serial console and powering off.
+    """
+    return {
+        "user_data": user_data,
+        "meta_data": f"instance-id: {instance_id}\nlocal-hostname: {instance_id}\nnetwork:\n  config: disabled\n",
+        "argv": [
+            "qemu-system-aarch64",
+            "-machine", "virt,accel=hvf", "-cpu", "host", "-smp", "2", "-m", "2048",
+            "-drive", f"if=pflash,format=raw,readonly=on,file={efi_code}",
+            "-drive", f"if=pflash,format=raw,file={runner_dir}/efi-vars.fd",
+            "-drive", f"if=virtio,format=qcow2,file={image}",
+            "-drive", f"if=virtio,format=raw,file={runner_dir}/seed.iso",
+            "-snapshot",
+            "-nographic", "-serial", "mon:stdio", "-display", "none",
+        ],
+    }
+
+
+def build_seed_iso_argv(seed_dir, iso_path, platform=None):
+    """NoCloud seed: an ISO whose volume label is `cidata` holding user-data + meta-data."""
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return ["hdiutil", "makehybrid", "-o", iso_path, "-iso", "-joliet",
+                "-default-volume-name", "cidata", seed_dir]
+    return ["genisoimage", "-output", iso_path, "-volid", "cidata", "-joliet", "-rock", seed_dir]
+
+
+def verify_sha256_line(sums_text, filename, digest):
+    """True only if SHA256SUMS lists `filename` with exactly `digest`. A missing line is a
+    refusal, not a pass -- an image we cannot check is not booted."""
+    for line in (sums_text or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == filename:
+            return parts[0].lower() == digest.lower()
+    return False
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def run_qemu_vm(spec, runner_dir, vars_template, timeout=900, runner=subprocess.run, platform=None):
+    """Write the seed ISO and a fresh EFI vars copy into runner_dir, boot, return serial text.
+
+    The VM is expected to power itself off; `timeout` bounds a guest that never does.
+    """
+    seed_dir = os.path.join(runner_dir, "seed")
+    os.makedirs(seed_dir, exist_ok=True)
+    with open(os.path.join(seed_dir, "user-data"), "w") as f:
+        f.write(spec["user_data"])
+    with open(os.path.join(seed_dir, "meta-data"), "w") as f:
+        f.write(spec["meta_data"])
+    iso = os.path.join(runner_dir, "seed.iso")
+    if os.path.exists(iso):
+        os.remove(iso)
+    proc = runner(build_seed_iso_argv(seed_dir, iso, platform), capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"seed ISO build failed: {proc.stderr.strip()}")
+    shutil.copyfile(vars_template, os.path.join(runner_dir, "efi-vars.fd"))
+    proc = runner(spec["argv"], capture_output=True, text=True, timeout=timeout,
+                  stdin=subprocess.DEVNULL)
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
 def parse_mechanism_probe(text):
     """Parse a probe result.
 
@@ -134,6 +213,9 @@ def parse_mechanism_probe(text):
     result = fields.get("RESULT", "")
     return {
         "kernel": fields.get("KERNEL", ""),
+        # seccomp filters are arch-specific, so a result without its arch does not transfer.
+        # Empty (not guessed) when the probe output predates the ARCH line.
+        "arch": fields.get("ARCH", ""),
         "probe": fields.get("PROBE", ""),
         "result": result,
         "measured": bool(result) and not result.startswith("probe-unavailable"),

@@ -207,3 +207,54 @@ class RegisterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PerPrimitiveExecutionTests(unittest.TestCase):
+    """mEllergrace/AKCM-Mappings#1: one execution block used to attest every primitive."""
+
+    def _two(self):
+        e = _valid_entry()
+        p2 = copy.deepcopy(e["primitives"][0])
+        p2["primitive"] = "seccomp"
+        e["primitives"].append(p2)
+        return e
+
+    def test_default_behaviour_is_unchanged(self):
+        self.assertEqual(cce.check_entry(self._two(), "catalog/UEM-10.yaml"), [])
+
+    def test_strict_mode_names_every_primitive_without_its_own_record(self):
+        v = cce.check_entry(self._two(), "catalog/UEM-10.yaml", require_per_primitive=True)
+        self.assertEqual(len([x for x in v if "own execution record" in x]), 2)
+
+    def test_strict_mode_passes_when_each_primitive_was_executed(self):
+        e = self._two()
+        for p in e["primitives"]:
+            p["execution"] = dict(e["provenance"]["execution"])
+        self.assertEqual(cce.check_entry(e, "catalog/UEM-10.yaml", require_per_primitive=True), [])
+
+    def test_an_incomplete_per_primitive_block_is_always_a_violation(self):
+        e = _valid_entry()
+        e["primitives"][0]["execution"] = {"kernel_release": "6.8.0-142-generic"}
+        v = cce.check_entry(e, "catalog/UEM-10.yaml")
+        self.assertTrue(any("primitives[0].execution.kernel_arch" in x for x in v), v)
+
+
+class AicmDomainTests(unittest.TestCase):
+    """#8: aicm_domain replaces atf_pillar; entries with only atf_pillar remain valid."""
+
+    def test_aicm_domain_alone_is_valid(self):
+        e = _valid_entry()
+        del e["atf_pillar"]
+        e["aicm_domain"] = "Universal Endpoint Management"
+        self.assertEqual(cce.check_entry(e, "catalog/UEM-10.yaml"), [])
+
+    def test_neither_field_is_a_violation(self):
+        e = _valid_entry()
+        del e["atf_pillar"]
+        self.assertTrue(any("aicm_domain is required" in x for x in cce.check_entry(e, "catalog/UEM-10.yaml")))
+
+    def test_legacy_atf_pillar_still_accepted_and_still_validated(self):
+        self.assertEqual(cce.check_entry(_valid_entry(), "catalog/UEM-10.yaml"), [])
+        e = _valid_entry()
+        e["atf_pillar"] = "not-a-pillar"
+        self.assertTrue(cce.check_entry(e, "catalog/UEM-10.yaml"))
